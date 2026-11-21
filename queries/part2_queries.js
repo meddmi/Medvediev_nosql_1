@@ -50,13 +50,6 @@ db.tracks
 section("Task 2. Artists with consistently popular tracks (top 20)");
 
 db.tracks.aggregate([
-  {
-    $match: {
-      popularity: {
-        $gte: 60
-      }
-    }
-  },
   { $unwind: "$artists" },
   {
     $group: {
@@ -68,7 +61,8 @@ db.tracks.aggregate([
   },
   {
     $match: {
-      track_count: { $gte: 3 }
+      track_count: { $gte: 3 },
+      min_popularity: { $gte: 60 }
     }
   },
   { $sort: { avg_popularity: -1, track_count: -1, _id: 1 } },
@@ -121,8 +115,8 @@ db.tracks.aggregate([
       outlier_threshold: 1,
       outlier_tracks: {
         $filter: {
-          input: "$tracks", 
-          as: "track",         
+          input: "$tracks",
+          as: "track",
           cond: {
             $gt: [ "$$track.audio_features.tempo", "$outlier_threshold" ]
           }

@@ -1,4 +1,60 @@
 # Medvediev_nosql_1
+
+Spotify tracks dataset (about 114k rows, Kaggle) loaded into MongoDB Atlas, reshaped into a document schema with an aggregation pipeline, queried, and then tuned with indexes.
+
+| Part | Content | Files |
+|---|---|---|
+| 1 | Load the raw data, transform the schema, schema questions | `scripts/01_load_data.py`, `scripts/02_transform.js` |
+| 2 | Four queries | `queries/part2_queries.js` |
+| 3 | Indexes and `explain()` | `queries/part3_indexes.js` |
+
+## Environment setup
+
+**Requirements:** Python 3.11+, [`mongosh`](https://www.mongodb.com/docs/mongodb-shell/install/), and a MongoDB Atlas cluster (the free M0 tier is enough).
+
+1. **Atlas.** Create an M0 cluster, create a database user (Database Access), allow your IP (Network Access), then copy the connection string from Connect -> Drivers.
+2. **Python dependencies.**
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
+3. **`.env`** in the project root (the file is git-ignored). The scripts read the connection string from `MONGODB_URI`:
+   ```
+   MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/
+   ```
+4. **Dataset.** The Kaggle CSV is already in `data/dataset.csv`.
+5. **Run the scripts from the project root, in this order:**
+   ```bash
+   set -a; source .env; set +a                      # exports MONGODB_URI to the shell for mongosh
+
+   python scripts/01_load_data.py                   # CSV -> spotify.tracks_raw (flat documents)
+   mongosh "$MONGODB_URI" --file scripts/02_transform.js      # tracks_raw -> spotify.tracks (final schema)
+   mongosh "$MONGODB_URI" --file queries/part2_queries.js     # Part 2 queries
+   mongosh "$MONGODB_URI" --file queries/part3_indexes.js     # Part 3 explain() before/after (creates indexes)
+   ```
+   All scripts are idempotent: `01_load_data.py` drops `tracks_raw` first, `02_transform.js` drops `tracks` first, and `part3_indexes.js` drops its indexes before recreating them.
+
+Expected counts: `tracks_raw` and `tracks` both contain **113,999** documents.
+
+## Data schema
+
+The `spotify.tracks` collection (output of `scripts/02_transform.js`). Compared with the flat CSV, the 12 audio fields moved into `audio_features`, `artists` became an array, and two computed fields were added.
+
+![track raw example](screenshots/1.1%20track%20raw%20example.png)
+![track example](screenshots/1.2%20track%20example.png)
+
+| Field | Type | Notes |
+|---|---|---|
+| `track_id`, `track_name`, `album_name`, `track_genre` | string | `track_id` is not unique, see the note below |
+| `artists` | array of strings | `"Drake; Future"` is split on `;` and trimmed |
+| `popularity` | int | 0-100 |
+| `explicit` | bool | |
+| `duration_ms` | int | |
+| `duration_sec` | double | computed: `duration_ms / 1000`, rounded to 1 decimal |
+| `popularity_tier` | string | computed: `high` (>= 70), `medium` (40-69), `low` (< 40) |
+| `audio_features` | object | `danceability`, `energy`, `loudness`, `speechiness`, `acousticness`, `instrumentalness`, `liveness`, `valence`, `tempo` (doubles), `key`, `mode`, `time_signature` (ints) |
+
 ## Part 1 — Schema design questions
 
 ### Why are the audio characteristics grouped into a nested `audio_features` object instead of being stored flat?
@@ -41,9 +97,68 @@ Queries that become simpler or possible:
 
 **Indexing.** A single index on `artists` becomes a multikey index with one entry per element, so `{ artists: "Drake" }` is an index lookup. A regex search over strings would scan the whole collection.
 
-## Part 3
+Part 2, Task 2 relies on this directly: `$unwind: "$artists"` gives one row per (track, artist) pair, so a collaboration counts for every artist on it.
+
+## Part 2 — Queries
+
+All four queries are in `queries/part2_queries.js`. Every query reads from `spotify.tracks` and uses the nested paths (`audio_features.*`).
+
+### Task 1. Party tracks
+
+```js
+db.tracks.find({
+  "audio_features.danceability": { $gt: 0.7 },
+  "audio_features.energy":       { $gt: 0.7 },
+  duration_ms: { $gte: 180000, $lte: 300000 }
+})
+```
+
+### Task 2. Artists whose tracks are all popular
+
+An artist qualifies if they have **at least 3 tracks** and the **minimum popularity of all their tracks is at least 60**. The pipeline:
+
+1. `$unwind: "$artists"` produces one document per (track, artist) pair.
+2. `$group` by artist over **all** of the artist's tracks: `track_count` (`$sum`), `min_popularity` (`$min`), `avg_popularity` (`$avg`).
+3. `$match: { track_count: { $gte: 3 }, min_popularity: { $gte: 60 } }`. Filtering after the group is what makes "all tracks are popular" true.
+4. `$sort` by `avg_popularity` descending (ties: more tracks first, then name), `$limit: 20`.
+5. `$project` renames `_id` to `artist` and rounds both popularity values to 1 decimal with `$round`.
+
+Top of the result:
+
+| artist | track_count | min_popularity | avg_popularity |
+|---|---|---|---|
+| Harry Styles | 3 | 89 | 92 |
+| Luar La L | 4 | 90 | 90.5 |
+| Olivia Rodrigo | 5 | 86 | 87.4 |
+| BYOR | 4 | 87 | 87 |
+| IVE | 3 | 79 | 84 |
+
+### Task 3. Tracks with unusually high tempo for their genre
+
+An outlier is a track with `tempo > genre mean + 2 * genre standard deviation`. The pipeline:
+
+1. `$group` by `track_genre`: `avg_tempo` with `$avg`, `std_tempo` with `$stdDevPop`, and `$push` of a small summary of each track (`_id`, `track_name`, `popularity`, `artists`, `audio_features.tempo`). 114 genres, about 1,000 tracks each, so the array is far below the 16 MB document limit.
+2. `$addFields` computes `outlier_threshold = avg_tempo + 2 * std_tempo`.
+3. `$project` keeps `genre`, `avg_tempo`, `outlier_threshold`, and builds `outlier_tracks` with `$filter` over the pushed array (`tempo > outlier_threshold`).
+4. `$sort` by genre.
+
+### Task 4. Background work tracks
+
+```js
+db.tracks.find({
+  "audio_features.loudness":         { $lt: -10 },
+  "audio_features.speechiness":      { $lt: 0.1 },
+  "audio_features.instrumentalness": { $gt: 0.5 },
+  explicit: false
+})
+```
+
+## Part 3 — Indexes and optimization (self-study, not graded)
+
+All scripts are in `queries/part3_indexes.js`. The numbers come from `explain("executionStats")` on the real `spotify.tracks` collection.
 
 ### Task 1 — Query analysis and indexing
+
 Query under analysis:
 
 ```js
@@ -53,7 +168,7 @@ db.tracks.find({
 }).sort({ popularity: -1 })
 ```
 
-Index created (in `queries/part3_indexes.js`):
+Index created (ESR order: Equality, Sort, Range):
 
 ```js
 db.tracks.createIndex(
@@ -62,21 +177,36 @@ db.tracks.createIndex(
 )
 ```
 
-The scripts are in `queries/part3_indexes.js`. The numbers below come from `explain("executionStats")` on the real `spotify.tracks` collection (113,999 documents, MongoDB 8.0.39).
+Key `explain()` fields:
 
-### What changed in the execution plan?
+| | Before (no index) | After (compound index) |
+|---|---|---|
+| Plan stages | `SORT` <- `COLLSCAN` | `FETCH` <- `IXSCAN` |
+| Index used | none (only the default `_id_` index exists) | `genre_popularity_danceability` |
+| In-memory `SORT` stage | yes | **no** |
+| `totalKeysExamined` | 0 | 412 |
+| `totalDocsExamined` | **113,999** | **354** |
+| `nReturned` | 354 | 354 |
+| `executionTimeMillis` | 72 | 2 |
 
-![Task 1 index analysis: explain output before](screenshots/3.1%20index%20analysis%20before.png)
-![Task 1 index analysis: explain output after](screenshots/3.1%20index%20analysis%20after.png)
+Before:
+
+![Task 1: explain output before the index](screenshots/3.1%20index%20analysis%20before.png)
+
+After:
+
+![Task 1: explain output after the index](screenshots/3.1%20index%20analysis%20after.png)
+
+#### What changed in the execution plan?
 
 - **Before.** MongoDB had no useful index, so it read every document in the collection (`COLLSCAN`), applied both filters to each one, and then sorted the 354 matches by `popularity` in memory (`SORT`).
 - **After.** MongoDB walks the new index (`IXSCAN`) and fetches only the documents that match (`FETCH`).
   - `track_genre` is an equality, so the scan is restricted to the `"pop"` part of the index.
   - Within that part the entries are already ordered by `popularity` descending, which is the requested order. The `SORT` stage disappeared because the index provides the order.
   - The `danceability >= 0.7` range is checked on the index entries, so non-matching tracks are not fetched from disk. 412 keys were examined, 354 documents were fetched, and each fetched document was a result.
-- **Result.** The same 354 documents are returned, but 322x fewer documents are read and the query is about 60x faster in this run (72 ms -> 2 ms). On a bigger collection the gap would grow, because the collection scan grows with total size while the index scan grows only with the number of `"pop"` entries.
+- **Result.** The same 354 documents are returned, but about 322x fewer documents are read (113,999 -> 354) and the query is about 36x faster in this run (72 ms -> 2 ms). On a bigger collection the gap would grow, because the collection scan grows with total size while the index scan grows only with the number of `"pop"` entries.
 
-### How can we tell that the index is actually used?
+#### How can we tell that the index is actually used?
 
 1. **`queryPlanner.winningPlan`: the stage names.**
    - Index used: the plan contains `IXSCAN`.
@@ -109,7 +239,7 @@ db.tracks.find({
 })
 ```
 
-Index (in `queries/part3_indexes.js`):
+Index:
 
 ```js
 db.tracks.createIndex(
@@ -118,10 +248,26 @@ db.tracks.createIndex(
 )
 ```
 
-**`explain("executionStats")` before and after**:
+`explicit` is an equality, so it goes first. The other two fields are both ranges. Only one range can narrow the index scan tightly, so they are listed after the equality field.
 
-![Task 2 index analysis: explain output before](screenshots/3.2%20index%20analysis%20before.png)
-![Task 2 index analysis: explain output after](screenshots/3.2%20index%20analysis%20after.png)
+Key `explain()` fields:
+
+| | Before (no index) | After |
+|---|---|---|
+| Plan stages | `COLLSCAN` | `FETCH` <- `IXSCAN` |
+| Index used | none | `explicit_instrumentalness_speechiness` |
+| `totalKeysExamined` | 0 | 16,602 |
+| `totalDocsExamined` | 113,999 | 16,141 |
+| `nReturned` | 16,141 | 16,141 |
+| `executionTimeMillis` | 122 | 35 |
+
+Before:
+
+![Task 2: explain output before the index](screenshots/3.2%20index%20analysis%20before.png)
+
+After:
+
+![Task 2: explain output after the index](screenshots/3.2%20index%20analysis%20after.png)
 
 **How the output proves the index is used:**
 
@@ -151,14 +297,35 @@ db.tracks.find({
 A query is covered when MongoDB can answer it using only the index, without reading any document from the collection. Two conditions must both hold:
 
 1. **Every field used in the filter (and sort) is in the index.**
-2. **Every field in the result is in the index.** 
+2. **Every field in the result is in the index.** The result is defined by the projection.
 
 **Condition 1 is met.** The filter uses `track_genre` and `popularity`. Both are keys of the Task 1 index, and the leading key `track_genre` is used with an equality, so the index is usable. The index is also usable even though the third key `danceability` is not part of the filter.
 
-**Condition 2 is not met.** The query has no projection, so it returns **entire documents**. The index contains only `track_genre`, `popularity` and `audio_features.danceability` (plus a pointer to the document). MongoDB has to add a `FETCH` stage and read every matching document from the collection.
+**Condition 2 is not met.** The query has no projection, so it returns **entire documents** (`track_name`, `album_name`, `artists`, `audio_features`, and so on). The index contains only `track_genre`, `popularity` and `audio_features.danceability` (plus a pointer to the document). MongoDB has to add a `FETCH` stage and read every matching document from the collection.
 
 So the index makes the search fast, because it finds the 317 matching entries without scanning 113,999 documents, but it does not cover the query.
 
 **Covered query in `explain()`:** `totalDocsExamined: 0`, no `FETCH` stage, and `PROJECTION_COVERED` (or an `IXSCAN` directly under the projection stage) in `winningPlan`.
 
-![Task 3 covered query analysis](screenshots/3.3%20covered%20query%20analysis.png)
+**How to make it covered.** Project only fields that are in the index, and exclude `_id`:
+
+```js
+db.tracks.find(
+  { track_genre: "pop", popularity: { $gte: 70 } },
+  { _id: 0, track_genre: 1, popularity: 1 }
+)
+```
+
+I tested several projections on the real collection (`checkCovered` in `queries/part3_indexes.js`):
+
+| Projection | Covered? | `totalDocsExamined` | Why |
+|---|---|---|---|
+| none (as given) | No | 317 | whole documents are returned |
+| `{ _id: 0, track_genre: 1, popularity: 1 }` | **Yes** | **0** | only indexed fields, `_id` excluded |
+| `{ track_genre: 1, popularity: 1 }` | No | 317 | `_id` is returned by default and is not in the index |
+| `{ _id: 0, track_name: 1, popularity: 1 }` | No | 317 | `track_name` is not in the index |
+| `{ _id: 0, track_genre: 1, popularity: 1, "audio_features.danceability": 1 }` | **Yes** | **0** | all three fields are in the index |
+
+In all five cases `totalKeysExamined` and `nReturned` are 317.
+
+![Task 3: covered query analysis](screenshots/3.3%20covered%20query%20analysis.png)

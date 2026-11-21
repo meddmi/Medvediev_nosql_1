@@ -1,5 +1,4 @@
 import os
-import ast
 import pandas as pd
 from pymongo import MongoClient
 from tqdm import tqdm
